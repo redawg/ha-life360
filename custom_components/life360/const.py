@@ -15,6 +15,7 @@ MAX_LTD_LOGIN_ERROR_RETRIES = 30
 SPEED_FACTOR_MPH = 2.25
 SPEED_DIGITS = 1
 UPDATE_INTERVAL = timedelta(seconds=5)
+AUTO_REAUTH_INTERVAL = timedelta(minutes=30)
 
 ATTR_ADDRESS = "address"
 ATTR_AT_LOC_SINCE = "at_loc_since"
