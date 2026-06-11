@@ -7,6 +7,7 @@ from collections.abc import Callable, Coroutine, Iterable
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
 from functools import partial
 import logging
@@ -20,12 +21,18 @@ from propcache.api import cached_property
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
+from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.issue_registry import (
+    IssueSeverity,
+    async_create_issue,
+    async_delete_issue,
+)
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from . import helpers
 from .const import (
+    AUTO_REAUTH_INTERVAL,
     COMM_MAX_RETRIES,
     DOMAIN,
     LOGIN_ERROR_RETRY_DELAY,
@@ -105,6 +112,17 @@ class CirclesMembersDataUpdateCoordinator(DataUpdateCoordinator[CirclesMembersDa
         self.config_entry.async_on_unload(
             self.config_entry.add_update_listener(self._config_entry_updated)
         )
+        self._cancel_auto_reauth = async_track_time_interval(
+            hass,
+            self._async_scheduled_auto_reauth,
+            AUTO_REAUTH_INTERVAL,
+            name="Life360 auto re-auth",
+        )
+        self.config_entry.async_on_unload(self._cancel_auto_reauth)
+
+    async def async_startup(self) -> None:
+        """Recover disabled accounts and retry stale credentials on startup."""
+        await self._recover_accounts()
 
     async def async_shutdown(self) -> None:
         """Cancel any scheduled call, and ignore new runs."""
@@ -574,12 +592,101 @@ class CirclesMembersDataUpdateCoordinator(DataUpdateCoordinator[CirclesMembersDa
         acct.online = online
         async_dispatcher_send(self.hass, SIGNAL_ACCT_STATUS, aid)
 
+    @callback
+    def _async_scheduled_auto_reauth(self, _now: datetime) -> None:
+        """Periodically attempt to recover offline or disabled accounts."""
+        self.config_entry.async_create_background_task(
+            self.hass, self._recover_accounts(), "Life360 auto re-auth"
+        )
+
+    async def _recover_accounts(self) -> None:
+        """Try to re-authenticate disabled or offline accounts."""
+        for aid, acct in self._options.accounts.items():
+            if not acct.password and not acct.authorization:
+                continue
+            offline = aid in self._acct_data and not self._acct_data[aid].online
+            if acct.enabled and not offline:
+                continue
+            await self._try_auto_reauth(aid)
+
+    async def _try_auto_reauth(self, aid: AccountID) -> bool:
+        """Re-authenticate using stored password or bearer token."""
+        acct = self._options.accounts.get(aid)
+        if not acct:
+            return False
+
+        new_authorization: str | None = None
+        session = get_session(self.hass)
+        try:
+            name = aid if self._options.verbosity >= 3 else None
+            api = helpers.Life360(
+                session,
+                COMM_MAX_RETRIES,
+                authorization=acct.authorization or None,
+                name=name,
+                verbosity=self._options.verbosity,
+            )
+            if acct.password:
+                try:
+                    new_authorization = await api.login_by_username(aid, acct.password)
+                except (LoginError, Life360Error) as exc:
+                    _LOGGER.debug("Auto re-auth password login failed for %s: %s", aid, exc)
+                    return False
+            elif acct.authorization:
+                try:
+                    await api.get_me(raise_not_modified=False)
+                    new_authorization = acct.authorization
+                except (LoginError, Life360Error) as exc:
+                    _LOGGER.debug("Auto re-auth token check failed for %s: %s", aid, exc)
+                    return False
+            else:
+                return False
+        finally:
+            session.detach()
+
+        options = self._options.as_dict()
+        account_opts = options["accounts"][aid]
+        account_opts["authorization"] = new_authorization
+        account_opts["enabled"] = True
+        self.hass.config_entries.async_update_entry(self.config_entry, options=options)
+        async_delete_issue(self.hass, DOMAIN, aid)
+        _LOGGER.info("Auto re-authenticated Life360 account %s", aid)
+        return True
+
     def _handle_login_error(self, aid: AccountID) -> None:
         """Handle account login error."""
-        if (failed := self._acct_data[aid].failed).is_set():
+        if aid in self._acct_data and self._acct_data[aid].failed.is_set():
             return
-        # Signal all current requests using account to stop and return NO_DATA.
-        failed.set()
+        if aid in self._acct_data:
+            # Signal all current requests using account to stop and return NO_DATA.
+            self._acct_data[aid].failed.set()
+
+        self.config_entry.async_create_background_task(
+            self.hass,
+            self._handle_login_error_async(aid),
+            f"Life360 login recovery for {aid}",
+        )
+
+    async def _handle_login_error_async(self, aid: AccountID) -> None:
+        """Try automatic re-auth before disabling an account."""
+        if await self._try_auto_reauth(aid):
+            return
+
+        acct = self._options.accounts.get(aid)
+        if acct and acct.password:
+            _LOGGER.warning(
+                "Auto re-auth failed for %s; will retry every %i minutes",
+                aid,
+                int(AUTO_REAUTH_INTERVAL.total_seconds() // 60),
+            )
+            return
+
+        if acct and acct.authorization:
+            _LOGGER.warning(
+                "Stored Life360 token expired for %s; "
+                "update the access token in integration settings or add a password",
+                aid,
+            )
 
         # Create repair issue for account and disable it. Deleting repair issues will be
         # handled by config flow.
