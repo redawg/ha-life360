@@ -87,6 +87,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: L360ConfigEntry) -> bool
 
     coordinator = CirclesMembersDataUpdateCoordinator(hass, entry, store)
     await coordinator.async_config_entry_first_refresh()
+    await coordinator.async_startup()
     mem_coordinator: dict[MemberID, MemberDataUpdateCoordinator] = {}
     entry.runtime_data = L360Coordinators(coordinator, mem_coordinator)
 
