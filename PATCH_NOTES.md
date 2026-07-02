@@ -1,4 +1,4 @@
-# Life360 map update patch (v0.10.1-aschoenfeld.2)
+# Life360 map update patch (v0.10.1-aschoenfeld.3)
 
 Fork of [pnbruckner/ha-life360](https://github.com/pnbruckner/ha-life360) with improvements for stuck map markers on home/away transitions.
 
@@ -7,6 +7,7 @@ Fork of [pnbruckner/ha-life360](https://github.com/pnbruckner/ha-life360) with i
 - **`device_tracker.py`**: Accept coordinate updates when location or Life360 place actually changed, even if GPS accuracy filter or `last_seen` ordering would normally reject them. Force map redraw when accepted coordinates move. Auto-request Life360 burst updates on zone transitions (60s debounce).
 - **`coordinator.py`**: `always_update=True` on member coordinators so location writes propagate reliably.
 - **`coordinator.py`**: Automatic re-authentication — retries with stored password or bearer token on login failure, on startup, and every 30 minutes for disabled/offline accounts. Accounts with a stored password are not auto-disabled (keeps retrying).
+- **`coordinator.py`**: After successful re-auth, clear the failed-request lock and refresh data so trackers recover instead of staying stuck offline.
 
 ## Auto re-auth limits
 

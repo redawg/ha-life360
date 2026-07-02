@@ -651,7 +651,28 @@ class CirclesMembersDataUpdateCoordinator(DataUpdateCoordinator[CirclesMembersDa
         self.hass.config_entries.async_update_entry(self.config_entry, options=options)
         async_delete_issue(self.hass, DOMAIN, aid)
         _LOGGER.info("Auto re-authenticated Life360 account %s", aid)
+        if aid in self._acct_data:
+            self._apply_acct_recovery(aid, new_authorization)
+            self.config_entry.async_create_background_task(
+                self.hass, self.async_refresh(), f"Refresh after re-auth for {aid}"
+            )
         return True
+
+    def _apply_acct_recovery(self, aid: AccountID, authorization: str | None) -> None:
+        """Apply new credentials and unblock requests after successful re-auth."""
+        acct_data = self._acct_data[aid]
+        acct_data.api.authorization = authorization
+        acct_data.session.cookie_jar.clear()
+        if acct_data.failed.is_set():
+            acct_data.failed.clear()
+            acct_data.failed_task.cancel()
+            acct_data.failed_task = self.config_entry.async_create_background_task(
+                self.hass,
+                acct_data.failed.wait(),
+                f"Monitor failed requests to {aid}",
+            )
+        if not acct_data.online:
+            self._set_acct_exc(aid, online=True)
 
     def _handle_login_error(self, aid: AccountID) -> None:
         """Handle account login error."""
@@ -718,21 +739,23 @@ class CirclesMembersDataUpdateCoordinator(DataUpdateCoordinator[CirclesMembersDa
         new_accts = {
             aid: acct for aid, acct in new_options.accounts.items() if acct.enabled
         }
+
+        for aid, acct in new_options.accounts.items():
+            if acct.enabled and aid in self._acct_data:
+                acct_data = self._acct_data[aid]
+                acct_data.api.authorization = acct.authorization
+                acct_data.api.name = (
+                    aid
+                    if new_options.verbosity >= 3
+                    else f"Account {list(self._acct_data).index(aid) + 1}"
+                )
+                acct_data.api.verbosity = new_options.verbosity
+
         if old_accts == new_accts and old_options.verbosity == new_options.verbosity:
             return
 
         old_acct_ids = set(old_accts)
         new_acct_ids = set(new_accts)
-
-        for aid in old_acct_ids & new_acct_ids:
-            api = self._acct_data[aid].api
-            api.authorization = new_options.accounts[aid].authorization
-            api.name = (
-                aid
-                if new_options.verbosity >= 3
-                else f"Account {list(self._acct_data).index(aid) + 1}"
-            )
-            api.verbosity = new_options.verbosity
 
         if old_accts == new_accts:
             return
